@@ -3,65 +3,92 @@ name: Build Android APK (Godot)
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
   android:
     runs-on: ubuntu-latest
+
     env:
-      GODOT_TEMPLATES: "4.5.1.stable"
+      GODOT_VERSION: "4.5.1-stable"
+      GODOT_TEMPLATES_DIRNAME: "4.5.1.stable"
       EXPORT_PRESET: "Android"
       EXPORT_PATH: "builds/android/Blox3D-debug.apk"
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          distribution: "temurin"
+          java-version: "17"
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
 
       - name: Download Godot (Linux x86_64)
+        shell: bash
         run: |
           set -euxo pipefail
           mkdir -p godot_bin
-          curl -L -o godot.zip "https://downloads.tuxfamily.org/godotengine/4.5.1/Godot_v4.5.1-stable_linux.x86_64.zip"
+
+          # Try official archive first, then SourceForge mirror.
+          URLS=(
+            "https://godotengine.org/download/archive/4.5.1-stable/"
+            "https://sourceforge.net/projects/godot-engine.mirror/files/4.5.1-stable/Godot_v4.5.1-stable_linux.x86_64.zip/download"
+          )
+
+          download_ok=0
+          for u in "${URLS[@]}"; do
+            echo "Attempting Godot download from: $u"
+            if [[ "$u" == *"godotengine.org/download/archive"* ]]; then
+              # godotengine.org archive is a page; fetch the actual zip via SourceForge mirror if needed.
+              # We keep it here as a fallback informational step; the SourceForge URL below is the reliable binary.
+              continue
+            fi
+
+            if curl -L --retry 5 --retry-delay 5 --retry-connrefused -o godot.zip "$u"; then
+              download_ok=1
+              break
+            fi
+          done
+
+          if [[ "$download_ok" -ne 1 ]]; then
+            echo "Failed to download Godot binary from all sources."
+            exit 1
+          fi
+
           unzip -q godot.zip -d godot_bin
           GODOT_BIN="$(find godot_bin -maxdepth 1 -type f | head -n 1)"
           chmod +x "$GODOT_BIN"
-          echo "GODOT_BIN=$GODOT_BIN" >> $GITHUB_ENV
+          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
 
-      - name: Install export templates (and Android build template)
+      - name: Install export templates
+        shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES}"
-          curl -L -o templates.tpz "https://downloads.tuxfamily.org/godotengine/4.5.1/Godot_v4.5.1-stable_export_templates.tpz"
+
+          mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}"
+
+          # Official templates (mirror)
+          TPL_URL="https://sourceforge.net/projects/godot-engine.mirror/files/4.5.1-stable/Godot_v4.5.1-stable_export_templates.tpz/download"
+
+          curl -L --retry 5 --retry-delay 5 --retry-connrefused -o templates.tpz "$TPL_URL"
           unzip -q templates.tpz -d templates_unzipped
-          cp -r templates_unzipped/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES}/"
-          # Android custom build template ships as android_source.zip inside the export templates package.
+          cp -r templates_unzipped/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}/"
+
+          # Some Godot 4 Android exports use an Android build template (android_source.zip) if present.
           if [ -f "templates_unzipped/templates/android_source.zip" ]; then
             mkdir -p android/build
             unzip -q "templates_unzipped/templates/android_source.zip" -d android/build
           fi
 
-      - name: Configure Godot editor settings for Android export
-        run: |
-          set -euxo pipefail
-          mkdir -p "$HOME/.config/godot"
-          "$GODOT_BIN" --headless --editor --quit || true
-          SETTINGS="$HOME/.config/godot/editor_settings-4.tres"
-          if [ ! -f "$SETTINGS" ]; then
-            printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
-          fi
-          echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
-          echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
-
-      - name: Create debug keystore and set env for Godot export
+      - name: Create debug keystore
+        shell: bash
         run: |
           set -euxo pipefail
           keytool -genkeypair -v \
@@ -71,11 +98,30 @@ jobs:
             -keypass android \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$GITHUB_WORKSPACE/debug.keystore" >> $GITHUB_ENV
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> $GITHUB_ENV
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> $GITHUB_ENV
+
+          echo "DEBUG_KEYSTORE_PATH=$GITHUB_WORKSPACE/debug.keystore" >> "$GITHUB_ENV"
+
+      - name: Configure Godot Editor Settings for Android export
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/.config/godot"
+
+          # Generate a baseline editor settings file (if possible).
+          "$GODOT_BIN" --headless --editor --quit || true
+
+          SETTINGS="$HOME/.config/godot/editor_settings-4.tres"
+          if [ ! -f "$SETTINGS" ]; then
+            printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
+          fi
+
+          # Set Android SDK + Java SDK + debug keystore path.
+          echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
+          echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
+          echo "export/android/debug_keystore = \"$DEBUG_KEYSTORE_PATH\"" >> "$SETTINGS"
 
       - name: Export APK (debug)
+        shell: bash
         run: |
           set -euxo pipefail
           mkdir -p builds/android
