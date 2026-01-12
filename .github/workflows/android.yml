@@ -107,15 +107,12 @@ jobs:
           set -euxo pipefail
           mkdir -p "$HOME/.config/godot"
 
-          # Ensure settings file exists
           SETTINGS="$HOME/.config/godot/editor_settings-4.tres"
           printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
 
-          # Print debug info
           echo "JAVA_HOME=$JAVA_HOME"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
 
-          # Write Android config keys (explicit absolute paths)
           {
             echo "export/android/java_sdk_path = \"$JAVA_HOME\""
             echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\""
