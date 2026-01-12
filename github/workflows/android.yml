@@ -1,0 +1,88 @@
+name: Build Android APK (Godot)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      GODOT_TEMPLATES: "4.5.1.stable"
+      EXPORT_PRESET: "Android"
+      EXPORT_PATH: "builds/android/Blox3D-debug.apk"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Download Godot (Linux x86_64)
+        run: |
+          set -euxo pipefail
+          mkdir -p godot_bin
+          curl -L -o godot.zip "https://downloads.tuxfamily.org/godotengine/4.5.1/Godot_v4.5.1-stable_linux.x86_64.zip"
+          unzip -q godot.zip -d godot_bin
+          GODOT_BIN="$(find godot_bin -maxdepth 1 -type f | head -n 1)"
+          chmod +x "$GODOT_BIN"
+          echo "GODOT_BIN=$GODOT_BIN" >> $GITHUB_ENV
+
+      - name: Install export templates (and Android build template)
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES}"
+          curl -L -o templates.tpz "https://downloads.tuxfamily.org/godotengine/4.5.1/Godot_v4.5.1-stable_export_templates.tpz"
+          unzip -q templates.tpz -d templates_unzipped
+          cp -r templates_unzipped/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES}/"
+          # Android custom build template ships as android_source.zip inside the export templates package.
+          if [ -f "templates_unzipped/templates/android_source.zip" ]; then
+            mkdir -p android/build
+            unzip -q "templates_unzipped/templates/android_source.zip" -d android/build
+          fi
+
+      - name: Configure Godot editor settings for Android export
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/.config/godot"
+          "$GODOT_BIN" --headless --editor --quit || true
+          SETTINGS="$HOME/.config/godot/editor_settings-4.tres"
+          if [ ! -f "$SETTINGS" ]; then
+            printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
+          fi
+          echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
+          echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
+
+      - name: Create debug keystore and set env for Godot export
+        run: |
+          set -euxo pipefail
+          keytool -genkeypair -v \
+            -keystore debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$GITHUB_WORKSPACE/debug.keystore" >> $GITHUB_ENV
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> $GITHUB_ENV
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> $GITHUB_ENV
+
+      - name: Export APK (debug)
+        run: |
+          set -euxo pipefail
+          mkdir -p builds/android
+          "$GODOT_BIN" --headless --verbose --export-debug "$EXPORT_PRESET" "$EXPORT_PATH"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blox3D-debug-apk
+          path: builds/android/Blox3D-debug.apk
