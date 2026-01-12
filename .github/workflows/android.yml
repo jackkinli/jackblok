@@ -15,6 +15,9 @@ jobs:
       EXPORT_PRESET: "Android"
       EXPORT_PATH: "builds/android/Blox3D-debug.apk"
 
+      GODOT_ZIP_URL: "https://sourceforge.net/projects/godot-engine.mirror/files/4.5.1-stable/Godot_v4.5.1-stable_linux.x86_64.zip/download"
+      TEMPLATES_TPZ_URL: "https://sourceforge.net/projects/godot-engine.mirror/files/4.5.1-stable/Godot_v4.5.1-stable_export_templates.tpz/download"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,58 +33,54 @@ jobs:
         with:
           packages: "platform-tools platforms;android-35 build-tools;35.0.0"
 
-      - name: Download Godot (Linux x86_64)
+      - name: Install aria2 (robust downloads)
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y aria2
+
+      - name: Cache Godot downloads
+        uses: actions/cache@v4
+        with:
+          path: .cache/godot
+          key: godot-${{ runner.os }}-${{ env.GODOT_VERSION }}-${{ env.GODOT_TEMPLATES_DIRNAME }}
+
+      - name: Download Godot + export templates (resume/retry)
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p godot_bin
+          mkdir -p .cache/godot
 
-          # Try official archive first, then SourceForge mirror.
-          URLS=(
-            "https://godotengine.org/download/archive/4.5.1-stable/"
-            "https://sourceforge.net/projects/godot-engine.mirror/files/4.5.1-stable/Godot_v4.5.1-stable_linux.x86_64.zip/download"
-          )
-
-          download_ok=0
-          for u in "${URLS[@]}"; do
-            echo "Attempting Godot download from: $u"
-            if [[ "$u" == *"godotengine.org/download/archive"* ]]; then
-              # godotengine.org archive is a page; fetch the actual zip via SourceForge mirror if needed.
-              # We keep it here as a fallback informational step; the SourceForge URL below is the reliable binary.
-              continue
-            fi
-
-            if curl -L --retry 5 --retry-delay 5 --retry-connrefused -o godot.zip "$u"; then
-              download_ok=1
-              break
-            fi
-          done
-
-          if [[ "$download_ok" -ne 1 ]]; then
-            echo "Failed to download Godot binary from all sources."
-            exit 1
+          # Godot editor zip (~70MB)
+          if [ ! -f ".cache/godot/godot.zip" ]; then
+            aria2c -c -x 8 -s 8 -k 1M --retry-wait=5 --max-tries=20 \
+              -o ".cache/godot/godot.zip" "$GODOT_ZIP_URL"
           fi
 
-          unzip -q godot.zip -d godot_bin
+          # Export templates (~1.4GB) — this is what often fails with curl(18)
+          if [ ! -f ".cache/godot/templates.tpz" ]; then
+            aria2c -c -x 8 -s 8 -k 1M --retry-wait=5 --max-tries=20 \
+              -o ".cache/godot/templates.tpz" "$TEMPLATES_TPZ_URL"
+          fi
+
+      - name: Unpack Godot + templates
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf godot_bin templates_unzipped || true
+          mkdir -p godot_bin templates_unzipped
+
+          unzip -q .cache/godot/godot.zip -d godot_bin
           GODOT_BIN="$(find godot_bin -maxdepth 1 -type f | head -n 1)"
           chmod +x "$GODOT_BIN"
           echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
 
-      - name: Install export templates
-        shell: bash
-        run: |
-          set -euxo pipefail
-
           mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}"
-
-          # Official templates (mirror)
-          TPL_URL="https://sourceforge.net/projects/godot-engine.mirror/files/4.5.1-stable/Godot_v4.5.1-stable_export_templates.tpz/download"
-
-          curl -L --retry 5 --retry-delay 5 --retry-connrefused -o templates.tpz "$TPL_URL"
-          unzip -q templates.tpz -d templates_unzipped
+          unzip -q .cache/godot/templates.tpz -d templates_unzipped
           cp -r templates_unzipped/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}/"
 
-          # Some Godot 4 Android exports use an Android build template (android_source.zip) if present.
+          # If android_source.zip is present, unpack it (some exports use it)
           if [ -f "templates_unzipped/templates/android_source.zip" ]; then
             mkdir -p android/build
             unzip -q "templates_unzipped/templates/android_source.zip" -d android/build
@@ -98,8 +97,6 @@ jobs:
             -keypass android \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
-
-          echo "DEBUG_KEYSTORE_PATH=$GITHUB_WORKSPACE/debug.keystore" >> "$GITHUB_ENV"
 
       - name: Configure Godot Editor Settings for Android export
         shell: bash
