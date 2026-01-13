@@ -1,4 +1,4 @@
-name: Build Android APK (Godot 4.5.1)
+name: Build Android APK (Godot 4.4.1 fallback)
 
 on:
   workflow_dispatch:
@@ -9,8 +9,9 @@ jobs:
   android:
     runs-on: ubuntu-latest
 
+    # Workaround: Godot 4.5 Android export regression; 4.4.1 commonly works. :contentReference[oaicite:1]{index=1}
     container:
-      image: barichello/godot-ci:4.5.1
+      image: barichello/godot-ci:4.4.1
 
     env:
       HOME: /root
@@ -26,6 +27,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show Godot version
+        shell: bash
+        run: |
+          set -euxo pipefail
+          godot --version || true
+
       - name: Install JDK 17 (inside container)
         shell: bash
         run: |
@@ -35,29 +42,33 @@ jobs:
           java -version
           test -x "$JAVA_HOME/bin/jarsigner"
 
-      - name: Install Android SDK packages (Godot 4.5 requirements)
+      - name: Install Android SDK packages (Godot export requirements)
         shell: bash
         run: |
           set -euxo pipefail
-
           command -v sdkmanager
-
           yes | sdkmanager --licenses || true
 
+          # Godot docs list platform-tools/build-tools/platforms/cmdline-tools + NDK + CMake. :contentReference[oaicite:2]{index=2}
           sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
             "platform-tools" \
-            "build-tools;35.0.0" \
-            "platforms;android-35" \
             "cmdline-tools;latest" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
             "cmake;3.10.2.4988404" \
             "ndk;28.1.13356709"
 
-          echo "Build-tools:"
+          ls -la "$ANDROID_SDK_ROOT/platform-tools" || true
           ls -la "$ANDROID_SDK_ROOT/build-tools" || true
-          echo "Platforms:"
           ls -la "$ANDROID_SDK_ROOT/platforms" || true
-          echo "NDK:"
           ls -la "$ANDROID_SDK_ROOT/ndk" || true
+
+      - name: Verify Android export templates exist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find "$HOME/.local/share/godot/export_templates" -maxdepth 4 -type f \
+            -name "android_debug.apk" -o -name "android_release.apk" | head -n 50
 
       - name: Create debug keystore
         shell: bash
@@ -72,15 +83,14 @@ jobs:
             -dname "CN=Android Debug,O=Android,C=US"
           test -f "$GITHUB_WORKSPACE/debug.keystore"
 
-      - name: Configure Godot Editor Settings for Android export (4.5.x CI-safe)
+      - name: Configure Godot Editor Settings for Android export (4.4.x CI-safe)
         shell: bash
         run: |
           set -euxo pipefail
-
           mkdir -p "$HOME/.config/godot"
 
-          # Write settings to both files to avoid versioned filename mismatch.
-          for SETTINGS in "$HOME/.config/godot/editor_settings-4.tres" "$HOME/.config/godot/editor_settings-4.5.tres"; do
+          # 4.4.x typically uses editor_settings-4.4.tres, but we also write editor_settings-4.tres to be safe.
+          for SETTINGS in "$HOME/.config/godot/editor_settings-4.tres" "$HOME/.config/godot/editor_settings-4.4.tres"; do
             printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
 
             echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
@@ -89,24 +99,18 @@ jobs:
             echo "export/android/adb = \"$ANDROID_SDK_ROOT/platform-tools/adb\"" >> "$SETTINGS"
             echo "export/android/jarsigner = \"$JAVA_HOME/bin/jarsigner\"" >> "$SETTINGS"
 
-            # Debug keystore: must be all-or-nothing
+            # Debug keystore trio (all-or-nothing)
             echo "export/android/debug_keystore = \"$GITHUB_WORKSPACE/debug.keystore\"" >> "$SETTINGS"
             echo "export/android/debug_keystore_user = \"androiddebugkey\"" >> "$SETTINGS"
             echo "export/android/debug_keystore_pass = \"android\"" >> "$SETTINGS"
           done
 
-          echo "----- editor_settings-4.5.tres -----"
-          cat "$HOME/.config/godot/editor_settings-4.5.tres"
+          echo "----- editor_settings-4.4.tres -----"
+          cat "$HOME/.config/godot/editor_settings-4.4.tres" || true
           echo "-----------------------------------"
 
-          # Also set env overrides (belt + braces for headless CI)
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$GITHUB_WORKSPACE/debug.keystore" >> $GITHUB_ENV
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> $GITHUB_ENV
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> $GITHUB_ENV
-
-          # Sanity checks
-          test -x "$JAVA_HOME/bin/jarsigner"
           test -x "$ANDROID_SDK_ROOT/platform-tools/adb"
+          test -x "$JAVA_HOME/bin/jarsigner"
           test -f "$GITHUB_WORKSPACE/debug.keystore"
 
       - name: Export APK (debug)
@@ -127,7 +131,6 @@ jobs:
 
           test -f "$OUT_APK"
           ls -lh "$OUT_APK"
-
           exit $status
 
       - name: Upload APK artifact
