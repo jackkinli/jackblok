@@ -171,6 +171,12 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
 
+      - name: Set Godot debug keystore env vars (all-or-nothing)
+        run: |
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$GITHUB_WORKSPACE/debug.keystore" >> $GITHUB_ENV
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> $GITHUB_ENV
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> $GITHUB_ENV
+
       - name: Configure Godot Editor Settings for Android export
         shell: bash
         run: |
@@ -186,22 +192,13 @@ jobs:
 
           printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
 
-          # Required by Godot docs: Java SDK Path + Android SDK Path :contentReference[oaicite:5]{index=5}
+          # Only set the two required paths here
           echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
           echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
-
-          # Often required/checked in practice + Android docs mention setting debug keystore :contentReference[oaicite:6]{index=6}
-          echo "export/android/adb = \"$ANDROID_SDK_ROOT/platform-tools/adb\"" >> "$SETTINGS"
-          echo "export/android/jarsigner = \"$JAVA_HOME/bin/jarsigner\"" >> "$SETTINGS"
-          echo "export/android/debug_keystore = \"$GITHUB_WORKSPACE/debug.keystore\"" >> "$SETTINGS"
 
           echo "----- editor_settings-4.tres -----"
           cat "$SETTINGS"
           echo "---------------------------------"
-
-          # Verify tools exist
-          test -f "$JAVA_HOME/bin/jarsigner"
-          test -f "$ANDROID_SDK_ROOT/platform-tools/adb" || true
 
       - name: Verify Android export templates exist
         run: |
@@ -212,7 +209,11 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p builds/android
-          "$GODOT_BIN" --headless --verbose --export-debug "$EXPORT_PRESET" "$EXPORT_PATH"
+          "$GODOT_BIN" --headless --verbose --log-file export.log --export-debug "$EXPORT_PRESET" "$EXPORT_PATH" || true
+          echo "----- export.log -----"
+          cat export.log || true
+          echo "----------------------"
+          test -f "$EXPORT_PATH"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
