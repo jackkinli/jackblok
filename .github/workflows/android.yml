@@ -10,13 +10,15 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      GODOT_VERSION: "4.5.1-stable"
+      GODOT_TAG: "4.5.1-stable"
+      GODOT_VERSION: "4.5.1"
       GODOT_TEMPLATES_DIRNAME: "4.5.1.stable"
+
+      GODOT_ZIP_NAME: "Godot_v4.5.1-stable_linux.x86_64.zip"
+      TEMPLATES_TPZ_NAME: "Godot_v4.5.1-stable_export_templates.tpz"
+
       EXPORT_PRESET: "Android"
       EXPORT_PATH: "builds/android/Blox3D-debug.apk"
-
-      GODOT_ZIP_URL: "https://sourceforge.net/projects/godot-engine.mirror/files/4.5.1-stable/Godot_v4.5.1-stable_linux.x86_64.zip/download"
-      TEMPLATES_TPZ_URL: "https://sourceforge.net/projects/godot-engine.mirror/files/4.5.1-stable/Godot_v4.5.1-stable_export_templates.tpz/download"
 
     steps:
       - name: Checkout
@@ -33,34 +35,53 @@ jobs:
         with:
           packages: "platform-tools platforms;android-35 build-tools;35.0.0"
 
-      - name: Install aria2 (robust downloads)
+      - name: Install jq + aria2
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y aria2
+          sudo apt-get install -y jq aria2
 
       - name: Cache Godot downloads
         uses: actions/cache@v4
         with:
           path: .cache/godot
-          key: godot-${{ runner.os }}-${{ env.GODOT_VERSION }}-${{ env.GODOT_TEMPLATES_DIRNAME }}
+          key: godot-${{ runner.os }}-${{ env.GODOT_TAG }}-${{ env.GODOT_ZIP_NAME }}-${{ env.TEMPLATES_TPZ_NAME }}
 
-      - name: Download Godot + export templates (resume/retry)
+      - name: Download Godot + export templates (GitHub API, no SourceForge)
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p .cache/godot
 
-          # Godot editor zip (~70MB)
-          if [ ! -f ".cache/godot/godot.zip" ]; then
-            aria2c -c -x 8 -s 8 -k 1M --retry-wait=5 --max-tries=20 \
-              -o ".cache/godot/godot.zip" "$GODOT_ZIP_URL"
+          # Fetch release JSON for the tag
+          RELEASE_JSON="$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/godotengine/godot-builds/releases/tags/${GODOT_TAG}")"
+
+          # Pull the browser_download_url for the exact asset names
+          GODOT_URL="$(echo "$RELEASE_JSON" | jq -r --arg n "$GODOT_ZIP_NAME" \
+            '.assets[] | select(.name == $n) | .browser_download_url' | head -n 1)"
+          TEMPL_URL="$(echo "$RELEASE_JSON" | jq -r --arg n "$TEMPLATES_TPZ_NAME" \
+            '.assets[] | select(.name == $n) | .browser_download_url' | head -n 1)"
+
+          if [ -z "$GODOT_URL" ] || [ -z "$TEMPL_URL" ]; then
+            echo "Could not find expected assets on godotengine/godot-builds for tag ${GODOT_TAG}."
+            echo "Available assets:"
+            echo "$RELEASE_JSON" | jq -r '.assets[].name'
+            exit 1
           fi
 
-          # Export templates (~1.4GB) — this is what often fails with curl(18)
+          echo "Godot URL: $GODOT_URL"
+          echo "Templates URL: $TEMPL_URL"
+
+          if [ ! -f ".cache/godot/godot.zip" ]; then
+            aria2c -c -x 8 -s 8 -k 1M --retry-wait=5 --max-tries=20 \
+              -o ".cache/godot/godot.zip" "$GODOT_URL"
+          fi
+
           if [ ! -f ".cache/godot/templates.tpz" ]; then
             aria2c -c -x 8 -s 8 -k 1M --retry-wait=5 --max-tries=20 \
-              -o ".cache/godot/templates.tpz" "$TEMPLATES_TPZ_URL"
+              -o ".cache/godot/templates.tpz" "$TEMPL_URL"
           fi
 
       - name: Unpack Godot + templates
@@ -79,12 +100,6 @@ jobs:
           mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}"
           unzip -q .cache/godot/templates.tpz -d templates_unzipped
           cp -r templates_unzipped/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}/"
-
-          # If android_source.zip is present, unpack it (some exports use it)
-          if [ -f "templates_unzipped/templates/android_source.zip" ]; then
-            mkdir -p android/build
-            unzip -q "templates_unzipped/templates/android_source.zip" -d android/build
-          fi
 
       - name: Create debug keystore
         shell: bash
