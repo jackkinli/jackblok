@@ -43,6 +43,23 @@ jobs:
           echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
           java -version
 
+      - name: Install Android SDK packages (match target SDK)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # Make sure ANDROID_SDK_ROOT points at the real root
+          if [ -z "${ANDROID_SDK_ROOT:-}" ]; then
+            export ANDROID_SDK_ROOT="/usr/lib/android-sdk"
+          fi
+
+          yes | sdkmanager --licenses || true
+
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
       - name: Configure Godot Editor Settings for Android export
         shell: bash
         run: |
