@@ -33,6 +33,16 @@ jobs:
              "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
           ls -l "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable" | head -n 50
 
+      - name: Install JDK 17 inside container
+        shell: bash
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y openjdk-17-jdk
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
+          echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
+          java -version
+
       - name: Configure Godot Editor Settings for Android export
         shell: bash
         run: |
@@ -43,7 +53,7 @@ jobs:
             if command -v sdkmanager >/dev/null 2>&1; then
               SDKMANAGER_PATH="$(command -v sdkmanager)"
               # .../cmdline-tools/latest/bin/sdkmanager -> root is .../
-              ANDROID_SDK_ROOT="$(cd "$(dirname "$SDKMANAGER_PATH")/../.." && pwd)"
+              ANDROID_SDK_ROOT="$(cd "$(dirname "$SDKMANAGER_PATH")/../../.." && pwd)"
             elif command -v adb >/dev/null 2>&1; then
               ADB_PATH="$(command -v adb)"
               # .../platform-tools/adb -> root is .../
