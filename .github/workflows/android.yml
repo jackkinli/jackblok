@@ -105,7 +105,7 @@ jobs:
               -o ".cache/godot/templates.tpz" "$TEMPL_URL"
           fi
 
-      - name: Unpack Godot + templates
+      - name: Unpack Godot + templates (robust) + install Android build template into project
         shell: bash
         run: |
           set -euxo pipefail
@@ -120,7 +120,44 @@ jobs:
 
           mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}"
           unzip -q .cache/godot/templates.tpz -d templates_unzipped
-          cp -r templates_unzipped/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}/"
+
+          # Templates archive can be either:
+          #  A) templates_unzipped/templates/<files...>
+          #  B) templates_unzipped/templates/<version>/<files...>
+          if [ -f "templates_unzipped/templates/android_debug.apk" ]; then
+            cp -r templates_unzipped/templates/* \
+              "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}/"
+          elif [ -d "templates_unzipped/templates/${GODOT_TEMPLATES_DIRNAME}" ]; then
+            cp -r "templates_unzipped/templates/${GODOT_TEMPLATES_DIRNAME}/"* \
+              "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}/"
+          else
+            echo "Could not locate android_debug.apk inside templates.tpz"
+            find templates_unzipped -maxdepth 4 -type f | head -n 200
+            exit 1
+          fi
+
+          # Ensure Android build template exists in the project at android/build
+          # (Android guide: build template stored in android/build) :contentReference[oaicite:3]{index=3}
+          SRC_ZIP=""
+          if [ -f "templates_unzipped/templates/android_source.zip" ]; then
+            SRC_ZIP="templates_unzipped/templates/android_source.zip"
+          elif [ -f "templates_unzipped/templates/${GODOT_TEMPLATES_DIRNAME}/android_source.zip" ]; then
+            SRC_ZIP="templates_unzipped/templates/${GODOT_TEMPLATES_DIRNAME}/android_source.zip"
+          fi
+
+          if [ -n "$SRC_ZIP" ]; then
+            rm -rf android/build || true
+            mkdir -p android/build
+            unzip -q "$SRC_ZIP" -d android/build
+          else
+            echo "Warning: android_source.zip not found in templates.tpz (continuing)"
+          fi
+
+          echo "Templates installed at:"
+          ls -la "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}" | head -n 200
+          echo "Project android/build contents:"
+          ls -la android/build || true
+
 
       - name: Create debug keystore
         shell: bash
@@ -139,33 +176,32 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Normalize SDK root
+          # Normalize SDK root for safety
           if [ -z "${ANDROID_SDK_ROOT:-}" ]; then
             export ANDROID_SDK_ROOT="${ANDROID_HOME:-}"
           fi
-
-          echo "JAVA_HOME=$JAVA_HOME"
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
 
           mkdir -p "$HOME/.config/godot"
           SETTINGS="$HOME/.config/godot/editor_settings-4.tres"
 
           printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
-          {
-            echo "export/android/java_sdk_path = \"$JAVA_HOME\""
-            echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\""
-          } >> "$SETTINGS"
+
+          # Required by Godot docs: Java SDK Path + Android SDK Path :contentReference[oaicite:5]{index=5}
+          echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
+          echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
+
+          # Often required/checked in practice + Android docs mention setting debug keystore :contentReference[oaicite:6]{index=6}
+          echo "export/android/adb = \"$ANDROID_SDK_ROOT/platform-tools/adb\"" >> "$SETTINGS"
+          echo "export/android/jarsigner = \"$JAVA_HOME/bin/jarsigner\"" >> "$SETTINGS"
+          echo "export/android/debug_keystore = \"$GITHUB_WORKSPACE/debug.keystore\"" >> "$SETTINGS"
 
           echo "----- editor_settings-4.tres -----"
           cat "$SETTINGS"
           echo "---------------------------------"
 
-          # Prove the directories Godot checks actually exist
-          ls -la "$ANDROID_SDK_ROOT" || true
-          ls -la "$ANDROID_SDK_ROOT/build-tools" || true
-          ls -la "$ANDROID_SDK_ROOT/platform-tools" || true
-          ls -la "$ANDROID_SDK_ROOT/platforms" || true
+          # Verify tools exist
+          test -f "$JAVA_HOME/bin/jarsigner"
+          test -f "$ANDROID_SDK_ROOT/platform-tools/adb" || true
 
       - name: Export APK (debug)
         shell: bash
