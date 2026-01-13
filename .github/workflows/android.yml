@@ -1,235 +1,117 @@
-name: Build Android APK (Godot)
+name: Build Android APK
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
 
 jobs:
   android:
     runs-on: ubuntu-latest
 
+    # Prebuilt image for Godot CI exports (includes Godot + export templates tooling)
+    container:
+      image: barichello/godot-ci:4.5.1
+
     env:
-      GODOT_TAG: "4.5.1-stable"
       GODOT_VERSION: "4.5.1"
-      GODOT_TEMPLATES_DIRNAME: "4.5.1.stable"
-
-      GODOT_ZIP_NAME: "Godot_v4.5.1-stable_linux.x86_64.zip"
-      TEMPLATES_TPZ_NAME: "Godot_v4.5.1-stable_export_templates.tpz"
-
-      EXPORT_PRESET: "Android"
-      EXPORT_PATH: "builds/android/Blox3D-debug.apk"
+      EXPORT_PRESET: "Android"              # must match export_presets.cfg preset name exactly
+      OUT_DIR: "builds/android"
+      OUT_APK: "builds/android/Blox3D-debug.apk"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: "temurin"
-          java-version: "17"
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install required Android SDK packages for Godot
+      - name: Make export templates visible to runner user
         shell: bash
         run: |
           set -euxo pipefail
-
-          # GitHub runners usually set ANDROID_HOME, not always ANDROID_SDK_ROOT
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-
-          # Force ANDROID_SDK_ROOT to ANDROID_HOME if missing
-          if [ -z "${ANDROID_SDK_ROOT:-}" ]; then
-            echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
-            export ANDROID_SDK_ROOT="$ANDROID_HOME"
-          fi
-
-          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
-            "platform-tools" \
-            "build-tools;35.0.0" \
-            "platforms;android-35" \
-            "cmdline-tools;latest" \
-            "cmake;3.10.2.4988404" \
-            "ndk;28.1.13356709"
-
-      - name: Install jq + aria2
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y jq aria2
-
-      - name: Cache Godot downloads
-        uses: actions/cache@v4
-        with:
-          path: .cache/godot
-          key: godot-${{ runner.os }}-${{ env.GODOT_TAG }}-${{ env.GODOT_ZIP_NAME }}-${{ env.TEMPLATES_TPZ_NAME }}
-
-      - name: Download Godot + export templates (GitHub API, no SourceForge)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p .cache/godot
-
-          # Fetch release JSON for the tag
-          RELEASE_JSON="$(curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/godotengine/godot-builds/releases/tags/${GODOT_TAG}")"
-
-          # Pull the browser_download_url for the exact asset names
-          GODOT_URL="$(echo "$RELEASE_JSON" | jq -r --arg n "$GODOT_ZIP_NAME" \
-            '.assets[] | select(.name == $n) | .browser_download_url' | head -n 1)"
-          TEMPL_URL="$(echo "$RELEASE_JSON" | jq -r --arg n "$TEMPLATES_TPZ_NAME" \
-            '.assets[] | select(.name == $n) | .browser_download_url' | head -n 1)"
-
-          if [ -z "$GODOT_URL" ] || [ -z "$TEMPL_URL" ]; then
-            echo "Could not find expected assets on godotengine/godot-builds for tag ${GODOT_TAG}."
-            echo "Available assets:"
-            echo "$RELEASE_JSON" | jq -r '.assets[].name'
-            exit 1
-          fi
-
-          echo "Godot URL: $GODOT_URL"
-          echo "Templates URL: $TEMPL_URL"
-
-          if [ ! -f ".cache/godot/godot.zip" ]; then
-            aria2c -c -x 8 -s 8 -k 1M --retry-wait=5 --max-tries=20 \
-              -o ".cache/godot/godot.zip" "$GODOT_URL"
-          fi
-
-          if [ ! -f ".cache/godot/templates.tpz" ]; then
-            aria2c -c -x 8 -s 8 -k 1M --retry-wait=5 --max-tries=20 \
-              -o ".cache/godot/templates.tpz" "$TEMPL_URL"
-          fi
-
-      - name: Unpack Godot + templates (robust) + install Android build template into project
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          rm -rf godot_bin templates_unzipped || true
-          mkdir -p godot_bin templates_unzipped
-
-          unzip -q .cache/godot/godot.zip -d godot_bin
-          GODOT_BIN="$(find godot_bin -maxdepth 1 -type f | head -n 1)"
-          chmod +x "$GODOT_BIN"
-          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
-
-          mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}"
-          unzip -q .cache/godot/templates.tpz -d templates_unzipped
-
-          # Templates archive can be either:
-          #  A) templates_unzipped/templates/<files...>
-          #  B) templates_unzipped/templates/<version>/<files...>
-          if [ -f "templates_unzipped/templates/android_debug.apk" ]; then
-            cp -r templates_unzipped/templates/* \
-              "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}/"
-          elif [ -d "templates_unzipped/templates/${GODOT_TEMPLATES_DIRNAME}" ]; then
-            cp -r "templates_unzipped/templates/${GODOT_TEMPLATES_DIRNAME}/"* \
-              "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}/"
-          else
-            echo "Could not locate android_debug.apk inside templates.tpz"
-            find templates_unzipped -maxdepth 4 -type f | head -n 200
-            exit 1
-          fi
-
-          # Ensure Android build template exists in the project at android/build
-          # (Android guide: build template stored in android/build) :contentReference[oaicite:3]{index=3}
-          SRC_ZIP=""
-          if [ -f "templates_unzipped/templates/android_source.zip" ]; then
-            SRC_ZIP="templates_unzipped/templates/android_source.zip"
-          elif [ -f "templates_unzipped/templates/${GODOT_TEMPLATES_DIRNAME}/android_source.zip" ]; then
-            SRC_ZIP="templates_unzipped/templates/${GODOT_TEMPLATES_DIRNAME}/android_source.zip"
-          fi
-
-          if [ -n "$SRC_ZIP" ]; then
-            rm -rf android/build || true
-            mkdir -p android/build
-            unzip -q "$SRC_ZIP" -d android/build
-          else
-            echo "Warning: android_source.zip not found in templates.tpz (continuing)"
-          fi
-
-          echo "Templates installed at:"
-          ls -la "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}" | head -n 200
-          echo "Project android/build contents:"
-          ls -la android/build || true
-
-
-      - name: Create debug keystore
-        shell: bash
-        run: |
-          set -euxo pipefail
-          keytool -genkeypair -v \
-            -keystore debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+          mkdir -p "$HOME/.local/share/godot/export_templates"
+          # In this container, templates live under /root; move them into $HOME for the current user.
+          mv "/root/.local/share/godot/export_templates/${GODOT_VERSION}.stable" \
+             "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          ls -l "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable" | head -n 50
 
       - name: Configure Godot Editor Settings for Android export
         shell: bash
         run: |
           set -euxo pipefail
 
-          # Normalize SDK root (GitHub runners usually have ANDROID_HOME set)
+          # Try to discover ANDROID_SDK_ROOT if it isn't set
           if [ -z "${ANDROID_SDK_ROOT:-}" ]; then
-            export ANDROID_SDK_ROOT="${ANDROID_HOME:-}"
+            if command -v sdkmanager >/dev/null 2>&1; then
+              SDKMANAGER_PATH="$(command -v sdkmanager)"
+              # .../cmdline-tools/latest/bin/sdkmanager -> root is .../
+              ANDROID_SDK_ROOT="$(cd "$(dirname "$SDKMANAGER_PATH")/../.." && pwd)"
+            elif command -v adb >/dev/null 2>&1; then
+              ADB_PATH="$(command -v adb)"
+              # .../platform-tools/adb -> root is .../
+              ANDROID_SDK_ROOT="$(cd "$(dirname "$ADB_PATH")/.." && pwd)"
+            fi
+          fi
+
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<empty>}"
+          echo "JAVA_HOME=${JAVA_HOME:-<empty>}"
+
+          # Sanity checks
+          test -n "${ANDROID_SDK_ROOT:-}"
+          test -d "$ANDROID_SDK_ROOT"
+          test -n "${JAVA_HOME:-}"
+          test -x "$JAVA_HOME/bin/jarsigner"
+
+          # Pick newest build-tools folder (for apksigner/zipalign if present)
+          BT_DIR="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* 2>/dev/null | sort -V | tail -n 1 || true)"
+          APKSIGNER=""
+          ZIPALIGN=""
+          if [ -n "$BT_DIR" ]; then
+            [ -x "$BT_DIR/apksigner" ] && APKSIGNER="$BT_DIR/apksigner" || true
+            [ -x "$BT_DIR/zipalign" ] && ZIPALIGN="$BT_DIR/zipalign" || true
           fi
 
           mkdir -p "$HOME/.config/godot"
           SETTINGS="$HOME/.config/godot/editor_settings-4.tres"
 
-          # Recreate the settings file cleanly each run
-          printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
+          {
+            printf '[gd_resource type="EditorSettings" format=3]\n'
+            printf '[resource]\n'
 
-          # Required paths
-          echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
-          echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
+            # Required paths for Android export (Godot reads these from Editor Settings) :contentReference[oaicite:3]{index=3}
+            printf 'export/android/java_sdk_path = "%s"\n' "$JAVA_HOME"
+            printf 'export/android/android_sdk_path = "%s"\n' "$ANDROID_SDK_ROOT"
 
-          # Debug keystore MUST be all-or-nothing (path + user + pass)
-          echo "export/android/debug_keystore = \"$GITHUB_WORKSPACE/debug.keystore\"" >> "$SETTINGS"
-          echo "export/android/debug_keystore_user = \"androiddebugkey\"" >> "$SETTINGS"
-          echo "export/android/debug_keystore_pass = \"android\"" >> "$SETTINGS"
+            # Helpful explicit tool paths
+            printf 'export/android/adb = "%s"\n' "$ANDROID_SDK_ROOT/platform-tools/adb"
+            printf 'export/android/jarsigner = "%s"\n' "$JAVA_HOME/bin/jarsigner"
 
-          echo "----- editor_settings-4.tres -----"
-          cat "$SETTINGS"
-          echo "---------------------------------"
+            # Optional (only if found)
+            if [ -n "$APKSIGNER" ]; then printf 'export/android/apksigner = "%s"\n' "$APKSIGNER"; fi
+            if [ -n "$ZIPALIGN" ]; then printf 'export/android/zipalign = "%s"\n' "$ZIPALIGN"; fi
 
-          # Sanity checks
-          test -d "$ANDROID_SDK_ROOT"
-          test -d "$ANDROID_SDK_ROOT/platform-tools"
-          test -f "$JAVA_HOME/bin/jarsigner"
-          test -f "$GITHUB_WORKSPACE/debug.keystore"
+            # Debug keystore (Godot can also be overridden by env vars) :contentReference[oaicite:4]{index=4}
+            printf 'export/android/debug_keystore = "%s"\n' "$GITHUB_WORKSPACE/debug.keystore"
+            printf 'export/android/debug_keystore_user = "androiddebugkey"\n'
+            printf 'export/android/debug_keystore_pass = "android"\n'
 
-      - name: Verify Android export templates exist
-        run: |
-          ls -l "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}" || true
-          
-      - name: Export APK (debug)
+            # Avoid CI weirdness
+            printf 'export/android/timestamping_authority_url = ""\n'
+            printf 'export/android/shutdown_adb_on_exit = true\n'
+            printf 'export/android/force_system_user = false\n'
+          } > "$SETTINGS"
+
+          echo "---- editor_settings-4.tres ----"
+          sed -n '1,200p' "$SETTINGS"
+
+      - name: Export Android debug APK
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p builds/android
-
-          # Force Godot to use the repo as the project path (prevents "wrong working dir" issues)
-          set +e
-          "$GODOT_BIN" --headless --path "$GITHUB_WORKSPACE" --verbose --export-debug "$EXPORT_PRESET" "$EXPORT_PATH" 2>&1 | tee export.log
-          status=${PIPESTATUS[0]}
-          set -e
-
-          echo "----- LAST 200 LINES OF export.log -----"
-          tail -n 200 export.log || true
-          echo "---------------------------------------"
-
-          exit $status
+          mkdir -p "$OUT_DIR"
+          godot --headless --path . --export-debug "$EXPORT_PRESET" "$OUT_APK"
+          ls -lh "$OUT_APK"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Blox3D-debug-apk
-          path: builds/android/Blox3D-debug.apk
+          name: Blox3D-Android-APK
+          path: builds/android/*.apk
