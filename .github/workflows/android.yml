@@ -1,21 +1,30 @@
-name: Build Android APK
+name: Build Android APK (Godot 4.5.1)
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
   android:
     runs-on: ubuntu-latest
 
-    # Prebuilt image for Godot CI exports (includes Godot + export templates tooling)
+    # Godot CI image with Godot + export templates tooling baked in
     container:
       image: barichello/godot-ci:4.5.1
 
     env:
-      GODOT_VERSION: "4.5.1"
-      EXPORT_PRESET: "Android"              # must match export_presets.cfg preset name exactly
+      # Critical: keep Godot's home consistent in container jobs
+      HOME: /root
+
+      # Android SDK location inside container (common for Debian/Ubuntu-based images)
+      ANDROID_SDK_ROOT: /usr/lib/android-sdk
+      ANDROID_HOME: /usr/lib/android-sdk
+
+      # JDK path we'll install
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+
+      EXPORT_PRESET: "Android"
       OUT_DIR: "builds/android"
       OUT_APK: "builds/android/Blox3D-debug.apk"
 
@@ -23,122 +32,113 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Make export templates visible to runner user
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p "$HOME/.local/share/godot/export_templates"
-          # In this container, templates live under /root; move them into $HOME for the current user.
-          mv "/root/.local/share/godot/export_templates/${GODOT_VERSION}.stable" \
-             "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
-          ls -l "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable" | head -n 50
-
-      - name: Install JDK 17 inside container
+      - name: Install JDK 17 (inside container)
         shell: bash
         run: |
           set -euxo pipefail
           apt-get update
           apt-get install -y openjdk-17-jdk
-          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
-          echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
           java -version
+          test -x "$JAVA_HOME/bin/jarsigner"
 
       - name: Install Android SDK packages (match target SDK)
         shell: bash
         run: |
           set -euxo pipefail
 
-          # Make sure ANDROID_SDK_ROOT points at the real root
-          if [ -z "${ANDROID_SDK_ROOT:-}" ]; then
-            export ANDROID_SDK_ROOT="/usr/lib/android-sdk"
-          fi
+          # sdkmanager should exist in this image; if not, fail clearly.
+          command -v sdkmanager
 
           yes | sdkmanager --licenses || true
 
+          # Ensure build-tools/platforms exist for API 35
           sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
             "platform-tools" \
             "platforms;android-35" \
-            "build-tools;35.0.0"
+            "build-tools;35.0.0" \
+            "cmdline-tools;latest"
+
+          ls -la "$ANDROID_SDK_ROOT/build-tools" || true
+          ls -la "$ANDROID_SDK_ROOT/platforms" || true
+          ls -la "$ANDROID_SDK_ROOT/platform-tools" || true
+
+      - name: Verify Godot Android templates exist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Godot templates are typically already in this image under /root
+          find "$HOME/.local/share/godot/export_templates" -maxdepth 3 -type f -name "android_debug.apk" -o -name "android_release.apk" | head -n 20
+
+      - name: Create debug keystore
+        shell: bash
+        run: |
+          set -euxo pipefail
+          keytool -genkeypair -v \
+            -keystore debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          test -f "$GITHUB_WORKSPACE/debug.keystore"
 
       - name: Configure Godot Editor Settings for Android export
         shell: bash
         run: |
           set -euxo pipefail
 
-          # Try to discover ANDROID_SDK_ROOT if it isn't set
-          if [ -z "${ANDROID_SDK_ROOT:-}" ]; then
-            if command -v sdkmanager >/dev/null 2>&1; then
-              SDKMANAGER_PATH="$(command -v sdkmanager)"
-              # .../cmdline-tools/latest/bin/sdkmanager -> root is .../
-              ANDROID_SDK_ROOT="$(cd "$(dirname "$SDKMANAGER_PATH")/../../.." && pwd)"
-            elif command -v adb >/dev/null 2>&1; then
-              ADB_PATH="$(command -v adb)"
-              # .../platform-tools/adb -> root is .../
-              ANDROID_SDK_ROOT="$(cd "$(dirname "$ADB_PATH")/.." && pwd)"
-            fi
-          fi
-
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<empty>}"
-          echo "JAVA_HOME=${JAVA_HOME:-<empty>}"
-
-          # Sanity checks
-          test -n "${ANDROID_SDK_ROOT:-}"
-          test -d "$ANDROID_SDK_ROOT"
-          test -n "${JAVA_HOME:-}"
-          test -x "$JAVA_HOME/bin/jarsigner"
-
-          # Pick newest build-tools folder (for apksigner/zipalign if present)
-          BT_DIR="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* 2>/dev/null | sort -V | tail -n 1 || true)"
-          APKSIGNER=""
-          ZIPALIGN=""
-          if [ -n "$BT_DIR" ]; then
-            [ -x "$BT_DIR/apksigner" ] && APKSIGNER="$BT_DIR/apksigner" || true
-            [ -x "$BT_DIR/zipalign" ] && ZIPALIGN="$BT_DIR/zipalign" || true
-          fi
-
           mkdir -p "$HOME/.config/godot"
           SETTINGS="$HOME/.config/godot/editor_settings-4.tres"
 
-          {
-            printf '[gd_resource type="EditorSettings" format=3]\n'
-            printf '[resource]\n'
+          printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
 
-            # Required paths for Android export (Godot reads these from Editor Settings) :contentReference[oaicite:3]{index=3}
-            printf 'export/android/java_sdk_path = "%s"\n' "$JAVA_HOME"
-            printf 'export/android/android_sdk_path = "%s"\n' "$ANDROID_SDK_ROOT"
+          # Required paths
+          echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
+          echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
 
-            # Helpful explicit tool paths
-            printf 'export/android/adb = "%s"\n' "$ANDROID_SDK_ROOT/platform-tools/adb"
-            printf 'export/android/jarsigner = "%s"\n' "$JAVA_HOME/bin/jarsigner"
+          # Tool paths (avoid headless validation issues)
+          echo "export/android/adb = \"$ANDROID_SDK_ROOT/platform-tools/adb\"" >> "$SETTINGS"
+          echo "export/android/jarsigner = \"$JAVA_HOME/bin/jarsigner\"" >> "$SETTINGS"
 
-            # Optional (only if found)
-            if [ -n "$APKSIGNER" ]; then printf 'export/android/apksigner = "%s"\n' "$APKSIGNER"; fi
-            if [ -n "$ZIPALIGN" ]; then printf 'export/android/zipalign = "%s"\n' "$ZIPALIGN"; fi
+          # Debug keystore trio (all-or-nothing)
+          echo "export/android/debug_keystore = \"$GITHUB_WORKSPACE/debug.keystore\"" >> "$SETTINGS"
+          echo "export/android/debug_keystore_user = \"androiddebugkey\"" >> "$SETTINGS"
+          echo "export/android/debug_keystore_pass = \"android\"" >> "$SETTINGS"
 
-            # Debug keystore (Godot can also be overridden by env vars) :contentReference[oaicite:4]{index=4}
-            printf 'export/android/debug_keystore = "%s"\n' "$GITHUB_WORKSPACE/debug.keystore"
-            printf 'export/android/debug_keystore_user = "androiddebugkey"\n'
-            printf 'export/android/debug_keystore_pass = "android"\n'
+          echo "----- editor_settings-4.tres -----"
+          cat "$SETTINGS"
+          echo "---------------------------------"
 
-            # Avoid CI weirdness
-            printf 'export/android/timestamping_authority_url = ""\n'
-            printf 'export/android/shutdown_adb_on_exit = true\n'
-            printf 'export/android/force_system_user = false\n'
-          } > "$SETTINGS"
+          # Sanity checks
+          test -d "$ANDROID_SDK_ROOT"
+          test -x "$ANDROID_SDK_ROOT/platform-tools/adb"
+          test -x "$JAVA_HOME/bin/jarsigner"
+          test -f "$GITHUB_WORKSPACE/debug.keystore"
 
-          echo "---- editor_settings-4.tres ----"
-          sed -n '1,200p' "$SETTINGS"
-
-      - name: Export Android debug APK
+      - name: Export APK (debug)
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$OUT_DIR"
-          godot --headless --path . --export-debug "$EXPORT_PRESET" "$OUT_APK"
+
+          # Use --path so Godot definitely targets the checked-out project
+          set +e
+          godot --headless --path "$GITHUB_WORKSPACE" --verbose \
+            --export-debug "$EXPORT_PRESET" "$OUT_APK" 2>&1 | tee export.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          echo "----- LAST 250 LINES export.log -----"
+          tail -n 250 export.log || true
+          echo "-------------------------------------"
+
+          test -f "$OUT_APK"
           ls -lh "$OUT_APK"
+
+          exit $status
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Blox3D-Android-APK
-          path: builds/android/*.apk
+          name: Blox3D-debug-apk
+          path: builds/android/Blox3D-debug.apk
