@@ -1,4 +1,4 @@
-name: Build Android APK (Godot CI)
+name: Build Android APK (Godot 4.4.1 + Gradle)
 
 on:
   workflow_dispatch:
@@ -14,84 +14,31 @@ jobs:
 
     env:
       HOME: /root
+      ANDROID_SDK_ROOT: /usr/lib/android-sdk
+      ANDROID_HOME: /usr/lib/android-sdk
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+
       EXPORT_PRESET: "Android"
       OUT_DIR: "builds/android"
       OUT_APK: "builds/android/Blox3D-debug.apk"
-
-      # We'll install and enforce these:
-      ANDROID_PLATFORM: "android-35"
-      ANDROID_BUILD_TOOLS: "35.0.0"
-
-      # Java
-      JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install JDK 17 (inside container)
+      - name: Install JDK 17 + tools (inside container)
         shell: bash
         run: |
           set -euxo pipefail
           apt-get update
-          apt-get install -y openjdk-17-jdk
+          apt-get install -y openjdk-17-jdk unzip wget
           java -version
           test -x "$JAVA_HOME/bin/jarsigner"
 
-      - name: Detect ANDROID_SDK_ROOT (real SDK root, not cmdline-tools)
+      - name: Install Android SDK packages (API 35 + build-tools 35)
         shell: bash
         run: |
           set -euxo pipefail
-
-          # Common candidates first
-          CANDIDATES=(
-            "/usr/lib/android-sdk"
-            "/usr/local/lib/android/sdk"
-            "/usr/local/lib/android-sdk"
-            "/opt/android-sdk"
-          )
-
-          # Also derive from sdkmanager location if present
-          if command -v sdkmanager >/dev/null 2>&1; then
-            SM="$(command -v sdkmanager)"
-            # Walk upwards a bit until we find something that looks like the SDK root
-            p="$(dirname "$SM")"
-            for _ in 1 2 3 4 5 6 7 8; do
-              if [ -d "$p/platforms" ] || [ -d "$p/build-tools" ] || [ -d "$p/platform-tools" ]; then
-                CANDIDATES=("$p" "${CANDIDATES[@]}")
-                break
-              fi
-              p="$(dirname "$p")"
-            done
-          fi
-
-          SDKROOT=""
-          for c in "${CANDIDATES[@]}"; do
-            if [ -d "$c" ] && { [ -d "$c/cmdline-tools" ] || [ -d "$c/platform-tools" ] || [ -d "$c/platforms" ]; }; then
-              SDKROOT="$c"
-              break
-            fi
-          done
-
-          if [ -z "$SDKROOT" ]; then
-            echo "Could not detect ANDROID_SDK_ROOT. Listing /usr/lib and /usr/local:"
-            ls -la /usr/lib || true
-            ls -la /usr/local/lib || true
-            exit 1
-          fi
-
-          echo "Detected ANDROID_SDK_ROOT=$SDKROOT"
-          echo "ANDROID_SDK_ROOT=$SDKROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDKROOT" >> "$GITHUB_ENV"
-
-      - name: Install Android SDK packages (to detected SDK root)
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          # Reload env from previous step
-          source "$GITHUB_ENV"
-
           command -v sdkmanager
 
           yes | sdkmanager --licenses || true
@@ -99,23 +46,15 @@ jobs:
           sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
             "platform-tools" \
             "cmdline-tools;latest" \
-            "platforms;${ANDROID_PLATFORM}" \
-            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
             "cmake;3.10.2.4988404" \
             "ndk;28.1.13356709"
 
-          echo "== Verify SDK layout =="
-          ls -la "$ANDROID_SDK_ROOT" || true
-          ls -la "$ANDROID_SDK_ROOT/platform-tools" || true
-          ls -la "$ANDROID_SDK_ROOT/platforms" || true
-          ls -la "$ANDROID_SDK_ROOT/build-tools" || true
-          ls -la "$ANDROID_SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}" || true
+          test -x "$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner"
+          test -x "$ANDROID_SDK_ROOT/build-tools/35.0.0/zipalign"
 
-          # Hard requirement: apksigner must exist for the selected build-tools
-          test -x "$ANDROID_SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
-          test -x "$ANDROID_SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/zipalign"
-
-      - name: Create debug keystore
+      - name: Create debug keystore (and commit into workspace for export)
         shell: bash
         run: |
           set -euxo pipefail
@@ -126,59 +65,22 @@ jobs:
             -keypass android \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
+
+          # Godot preset above references res://debug.keystore
           test -f "$GITHUB_WORKSPACE/debug.keystore"
-
-      - name: Clean invalid preset overrides (min/target sdk require Gradle build)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          test -f export_presets.cfg
-
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("export_presets.cfg")
-          lines = p.read_text(encoding="utf-8").splitlines(True)
-
-          bad = ("gradle_build/min_sdk=", "gradle_build/target_sdk=")
-          out = [ln for ln in lines if not ln.strip().startswith(bad)]
-
-          p.write_text("".join(out), encoding="utf-8")
-          print("Stripped gradle_build/min_sdk and gradle_build/target_sdk from export_presets.cfg")
-          PY
 
       - name: Configure Godot Editor Settings for Android export
         shell: bash
         run: |
           set -euxo pipefail
-          source "$GITHUB_ENV"
-
           mkdir -p "$HOME/.config/godot"
-
-          # Godot 4.4.1 is reading editor_settings-4.4.tres in your log.
           for SETTINGS in "$HOME/.config/godot/editor_settings-4.tres" "$HOME/.config/godot/editor_settings-4.4.tres"; do
             printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
-
             echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
             echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
-
             echo "export/android/adb = \"$ANDROID_SDK_ROOT/platform-tools/adb\"" >> "$SETTINGS"
             echo "export/android/jarsigner = \"$JAVA_HOME/bin/jarsigner\"" >> "$SETTINGS"
-
-            # Debug keystore (must be complete)
-            echo "export/android/debug_keystore = \"$GITHUB_WORKSPACE/debug.keystore\"" >> "$SETTINGS"
-            echo "export/android/debug_keystore_user = \"androiddebugkey\"" >> "$SETTINGS"
-            echo "export/android/debug_keystore_pass = \"android\"" >> "$SETTINGS"
           done
-
-          echo "----- editor_settings-4.4.tres -----"
-          cat "$HOME/.config/godot/editor_settings-4.4.tres" || true
-          echo "-----------------------------------"
-
-          # Prove paths exist
-          test -x "$ANDROID_SDK_ROOT/platform-tools/adb"
-          test -x "$ANDROID_SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
-          test -x "$JAVA_HOME/bin/jarsigner"
-          test -f "$GITHUB_WORKSPACE/debug.keystore"
 
       - name: Export APK (debug)
         shell: bash
@@ -196,16 +98,11 @@ jobs:
           tail -n 200 export.log || true
           echo "-------------------------------------"
 
-          # Only assert APK exists if Godot exited OK
-          if [ "$status" -eq 0 ]; then
-            test -f "$OUT_APK"
-            ls -lh "$OUT_APK"
-          fi
+          test -f "$OUT_APK"
+          ls -lh "$OUT_APK"
+          exit $status
 
-          exit "$status"
-
-      - name: Upload APK artifact (only if export succeeded)
-        if: success()
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: Blox3D-debug-apk
