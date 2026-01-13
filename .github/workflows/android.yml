@@ -215,7 +215,18 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p builds/android
-          "$GODOT_BIN" --headless --verbose --export-debug "$EXPORT_PRESET" "$EXPORT_PATH" 2>&1 | tee export.log
+
+          # Force Godot to use the repo as the project path (prevents "wrong working dir" issues)
+          set +e
+          "$GODOT_BIN" --headless --path "$GITHUB_WORKSPACE" --verbose --export-debug "$EXPORT_PRESET" "$EXPORT_PATH" 2>&1 | tee export.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          echo "----- LAST 200 LINES OF export.log -----"
+          tail -n 200 export.log || true
+          echo "---------------------------------------"
+
+          exit $status
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
