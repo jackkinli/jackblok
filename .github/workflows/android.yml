@@ -1,4 +1,4 @@
-name: Build Android APK (Godot 4.4.1 + Gradle)
+name: Build Android APK (Godot 4.4.1)
 
 on:
   workflow_dispatch:
@@ -26,21 +26,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install JDK 17 + tools (inside container)
+      - name: Install JDK 17 (inside container)
         shell: bash
         run: |
           set -euxo pipefail
           apt-get update
-          apt-get install -y openjdk-17-jdk unzip wget
+          apt-get install -y openjdk-17-jdk
           java -version
           test -x "$JAVA_HOME/bin/jarsigner"
 
-      - name: Install Android SDK packages (API 35 + build-tools 35)
+      - name: Install Android SDK packages (API 35)
         shell: bash
         run: |
           set -euxo pipefail
           command -v sdkmanager
-
           yes | sdkmanager --licenses || true
 
           sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
@@ -51,31 +50,39 @@ jobs:
             "cmake;3.10.2.4988404" \
             "ndk;28.1.13356709"
 
+          # Prove build-tools are actually there
           test -x "$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner"
           test -x "$ANDROID_SDK_ROOT/build-tools/35.0.0/zipalign"
 
-      - name: Create debug keystore (and commit into workspace for export)
+      - name: Remove invalid preset overrides (min/target sdk require Gradle build)
         shell: bash
         run: |
           set -euxo pipefail
-          keytool -genkeypair -v \
-            -keystore debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+          test -f export_presets.cfg
 
-          # Godot preset above references res://debug.keystore
-          test -f "$GITHUB_WORKSPACE/debug.keystore"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("export_presets.cfg")
+          lines = p.read_text(encoding="utf-8").splitlines(True)
 
-      - name: Configure Godot Editor Settings for Android export
+          # These cause errors unless gradle_build/use_gradle_build=true
+          bad = ("gradle_build/min_sdk=", "gradle_build/target_sdk=")
+          out = [ln for ln in lines if not ln.strip().startswith(bad)]
+
+          p.write_text("".join(out), encoding="utf-8")
+          print("Stripped gradle_build/min_sdk and gradle_build/target_sdk from export_presets.cfg")
+          PY
+
+      - name: Configure Godot Editor Settings for Android export (NO debug keystore settings)
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$HOME/.config/godot"
+
+          # Your log shows Godot loads editor_settings-4.4.tres
           for SETTINGS in "$HOME/.config/godot/editor_settings-4.tres" "$HOME/.config/godot/editor_settings-4.4.tres"; do
             printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
+
             echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
             echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
             echo "export/android/adb = \"$ANDROID_SDK_ROOT/platform-tools/adb\"" >> "$SETTINGS"
@@ -98,7 +105,20 @@ jobs:
           tail -n 200 export.log || true
           echo "-------------------------------------"
 
-          exit $status
+          # Only require APK if export succeeded
+          if [ "$status" -eq 0 ]; then
+            test -f "$OUT_APK"
+            ls -lh "$OUT_APK"
+          fi
+
+          exit "$status"
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blox3D-debug-apk
+          path: builds/android/Blox3D-debug.apk
 
       - name: Upload export.log
         if: always()
@@ -106,9 +126,3 @@ jobs:
         with:
           name: export-log
           path: export.log
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Blox3D-debug-apk
-          path: builds/android/Blox3D-debug.apk
