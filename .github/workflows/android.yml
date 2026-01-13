@@ -2,7 +2,7 @@ name: Android (Debug APK)
 
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
   workflow_dispatch: {}
 
 jobs:
@@ -13,44 +13,65 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Make sure JAVA_HOME is real (your logs showed JAVA_HOME was empty)
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # 2) Install Android SDK bits (platform-tools, platforms, build-tools)
-      - name: Install Android SDK components
+      - name: Locate Android SDK + sdkmanager and install packages
         shell: bash
         run: |
           set -euxo pipefail
 
-          # Standard locations on GitHub runners:
-          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/lib/android-sdk}}"
-          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          # Prefer the SDK you actually have (your log shows this exists)
+          SDKROOT="/usr/local/lib/android/sdk"
+          if [ ! -d "$SDKROOT" ]; then
+            SDKROOT="/usr/lib/android-sdk"
+          fi
+          test -d "$SDKROOT"
 
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDKROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDKROOT" >> "$GITHUB_ENV"
 
-          # Ensure sdkmanager is available (ubuntu-latest normally has it)
-          if ! command -v sdkmanager >/dev/null 2>&1; then
-            echo "sdkmanager not found. ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-            ls -la "$ANDROID_SDK_ROOT" || true
+          # Find sdkmanager (not always on PATH)
+          SDKMANAGER=""
+          if [ -x "$SDKROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDKROOT/cmdline-tools/latest/bin/sdkmanager"
+          elif [ -x "$SDKROOT/cmdline-tools/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDKROOT/cmdline-tools/bin/sdkmanager"
+          else
+            # Search a little deeper for unusual layouts
+            SDKMANAGER="$(find "$SDKROOT/cmdline-tools" -type f -name sdkmanager -perm -111 | head -n 1 || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found under $SDKROOT/cmdline-tools"
+            find "$SDKROOT/cmdline-tools" -maxdepth 3 -type f -name sdkmanager || true
             exit 1
           fi
 
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+          echo "Using sdkmanager at: $SDKMANAGER"
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
 
-      # 3) Create a debug keystore we control, then force Godot to use it.
-      #    This fixes: "Either Debug Keystore, Debug User AND Debug Password..."
+          # Accept licenses + install what Godot needs
+          yes | "$SDKMANAGER" --sdk_root="$SDKROOT" --licenses || true
+
+          "$SDKMANAGER" --sdk_root="$SDKROOT" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          # Hard verify build tools we need exist
+          test -x "$SDKROOT/build-tools/35.0.0/apksigner"
+          test -x "$SDKROOT/build-tools/35.0.0/zipalign"
+          test -x "$SDKROOT/platform-tools/adb"
+
       - name: Create debug.keystore + set Godot debug keystore env vars (all-or-nothing)
         shell: bash
         run: |
           set -euxo pipefail
 
-          # Create a deterministic debug keystore in workspace
           KEYSTORE_PATH="$GITHUB_WORKSPACE/debug.keystore"
           rm -f "$KEYSTORE_PATH"
 
@@ -64,57 +85,19 @@ jobs:
             -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
 
-          # Force ALL THREE values so Godot is never in a partial state
+          test -f "$KEYSTORE_PATH"
+
+          # Force ALL THREE so Godot never hits the partial-config error
           echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
           echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
           echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
 
-      # Optional: strip known-bad fields if they exist in export_presets.cfg.
-      # (You saw errors when Min/Target SDK overrides were present without Gradle.)
-      - name: Sanitize export_presets.cfg (remove SDK overrides + partial debug keystore fields)
+      - name: Configure Godot Editor Settings for Android export (no partial keystore fields)
         shell: bash
         run: |
           set -euxo pipefail
-          if [ -f "export_presets.cfg" ]; then
-            cp export_presets.cfg export_presets.cfg.bak
+          source "$GITHUB_ENV"
 
-            # Remove any min/target overrides (only valid with Gradle Build enabled)
-            sed -i '/^min_sdk=/d;/^target_sdk=/d' export_presets.cfg
+          mkdir -p "$HOME/.config/godot"
 
-            # Remove preset-level debug keystore fields if partially present
-            # (we will rely on the env vars we set above)
-            sed -i '/^keystore\/debug=/d;/^keystore\/debug_user=/d;/^keystore\/debug_password=/d' export_presets.cfg
-
-            echo "Sanitized export_presets.cfg"
-          fi
-
-      # 4) Export using Godot headless.
-      # NOTE: you must have the Android export templates available in the runner/container you use.
-      - name: Export Android Debug APK
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p builds/android
-
-          # Helpful debug print
-          echo "JAVA_HOME=$JAVA_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$GODOT_ANDROID_KEYSTORE_DEBUG_PATH"
-
-          # Export
-          godot --headless --path "$GITHUB_WORKSPACE" --verbose \
-            --export-debug "Android" "builds/android/Blox3D-debug.apk" | tee export.log
-
-          test -f builds/android/Blox3D-debug.apk
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Blox3D-debug-apk
-          path: builds/android/Blox3D-debug.apk
-
-      - name: Upload export.log artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: export-log
-          path: export.log
+          # Godot 4.4.x reads
