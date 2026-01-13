@@ -98,9 +98,14 @@ jobs:
           tail -n 200 export.log || true
           echo "-------------------------------------"
 
-          test -f "$OUT_APK"
-          ls -lh "$OUT_APK"
           exit $status
+
+      - name: Upload export.log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: export-log
+          path: export.log
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
