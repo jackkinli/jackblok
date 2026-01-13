@@ -71,4 +71,130 @@ jobs:
           echo "Godot version:"
           godot --version
           echo "Templates installed:"
-          ls -la "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable" | head -
+          ls -la "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable" | head -n 50
+
+      - name: Locate Android SDK + sdkmanager and install packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # You already have an SDK at this location in your logs
+          SDKROOT="/usr/local/lib/android/sdk"
+          if [ ! -d "$SDKROOT" ]; then
+            SDKROOT="/usr/lib/android-sdk"
+          fi
+          test -d "$SDKROOT"
+
+          echo "ANDROID_SDK_ROOT=$SDKROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDKROOT" >> "$GITHUB_ENV"
+
+          # Find sdkmanager (not always on PATH)
+          SDKMANAGER=""
+          if [ -x "$SDKROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDKROOT/cmdline-tools/latest/bin/sdkmanager"
+          elif [ -x "$SDKROOT/cmdline-tools/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDKROOT/cmdline-tools/bin/sdkmanager"
+          else
+            SDKMANAGER="$(find "$SDKROOT/cmdline-tools" -type f -name sdkmanager -perm -111 | head -n 1 || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found under $SDKROOT/cmdline-tools"
+            find "$SDKROOT/cmdline-tools" -maxdepth 4 -type f -name sdkmanager || true
+            exit 1
+          fi
+
+          echo "Using sdkmanager at: $SDKMANAGER"
+          yes | "$SDKMANAGER" --sdk_root="$SDKROOT" --licenses || true
+
+          "$SDKMANAGER" --sdk_root="$SDKROOT" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          test -x "$SDKROOT/build-tools/35.0.0/apksigner"
+          test -x "$SDKROOT/build-tools/35.0.0/zipalign"
+          test -x "$SDKROOT/platform-tools/adb"
+
+      - name: Create debug.keystore + set Godot debug keystore env vars (all-or-nothing)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          KEYSTORE_PATH="$GITHUB_WORKSPACE/debug.keystore"
+          rm -f "$KEYSTORE_PATH"
+
+          keytool -genkeypair \
+            -keystore "$KEYSTORE_PATH" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+          test -f "$KEYSTORE_PATH"
+
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
+
+      - name: Configure Godot Editor Settings for Android export
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source "$GITHUB_ENV"
+
+          mkdir -p "$HOME/.config/godot"
+
+          # Godot 4.4.x may read editor_settings-4.4.tres; write both.
+          for SETTINGS in "$HOME/.config/godot/editor_settings-4.tres" "$HOME/.config/godot/editor_settings-4.4.tres"; do
+            printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
+            echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
+            echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
+            echo "export/android/adb = \"$ANDROID_SDK_ROOT/platform-tools/adb\"" >> "$SETTINGS"
+            echo "export/android/jarsigner = \"$JAVA_HOME/bin/jarsigner\"" >> "$SETTINGS"
+          done
+
+      - name: Export Android Debug APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$OUT_DIR"
+
+          echo "JAVA_HOME=$JAVA_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$GODOT_ANDROID_KEYSTORE_DEBUG_PATH"
+          godot --version
+
+          set +e
+          godot --headless --path "$GITHUB_WORKSPACE" --verbose \
+            --export-debug "$EXPORT_PRESET" "$OUT_APK" 2>&1 | tee export.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          echo "----- LAST 200 LINES export.log -----"
+          tail -n 200 export.log || true
+          echo "-------------------------------------"
+
+          if [ "$status" -eq 0 ]; then
+            test -f "$OUT_APK"
+            ls -lh "$OUT_APK"
+          fi
+
+          exit "$status"
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blox3D-debug-apk
+          path: builds/android/Blox3D-debug.apk
+
+      - name: Upload export.log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: export-log
+          path: export.log
