@@ -100,4 +100,52 @@ jobs:
 
           mkdir -p "$HOME/.config/godot"
 
-          # Godot 4.4.x reads
+          # Godot 4.4.x reads editor_settings-4.4.tres; write both for safety.
+          for SETTINGS in "$HOME/.config/godot/editor_settings-4.tres" "$HOME/.config/godot/editor_settings-4.4.tres"; do
+            printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
+            echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
+            echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
+            echo "export/android/adb = \"$ANDROID_SDK_ROOT/platform-tools/adb\"" >> "$SETTINGS"
+            echo "export/android/jarsigner = \"$JAVA_HOME/bin/jarsigner\"" >> "$SETTINGS"
+          done
+
+      - name: Export Android Debug APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p builds/android
+
+          echo "JAVA_HOME=$JAVA_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$GODOT_ANDROID_KEYSTORE_DEBUG_PATH"
+
+          set +e
+          godot --headless --path "$GITHUB_WORKSPACE" --verbose \
+            --export-debug "Android" "builds/android/Blox3D-debug.apk" 2>&1 | tee export.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          echo "----- LAST 200 LINES export.log -----"
+          tail -n 200 export.log || true
+          echo "-------------------------------------"
+
+          if [ "$status" -eq 0 ]; then
+            test -f builds/android/Blox3D-debug.apk
+            ls -lh builds/android/Blox3D-debug.apk
+          fi
+
+          exit "$status"
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blox3D-debug-apk
+          path: builds/android/Blox3D-debug.apk
+
+      - name: Upload export.log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: export-log
+          path: export.log
