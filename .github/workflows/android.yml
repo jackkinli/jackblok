@@ -9,7 +9,6 @@ jobs:
   android:
     runs-on: ubuntu-latest
 
-    # Fallback: 4.4.1 is often more reliable for Android export than 4.5.x in CI. 
     container:
       image: barichello/godot-ci:4.4.1
 
@@ -23,20 +22,9 @@ jobs:
       OUT_DIR: "builds/android"
       OUT_APK: "builds/android/Blox3D-debug.apk"
 
-      # Lock to SDK 33 because your logs show build-tools 33.0.2 is what Godot actually finds.
-      TARGET_SDK: "33"
-      BUILD_TOOLS: "33.0.2"
-      MIN_SDK: "24"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Show Godot version
-        shell: bash
-        run: |
-          set -euxo pipefail
-          godot --version || true
 
       - name: Install JDK 17 (inside container)
         shell: bash
@@ -47,7 +35,7 @@ jobs:
           java -version
           test -x "$JAVA_HOME/bin/jarsigner"
 
-      - name: Install Android SDK packages (match Target SDK)
+      - name: Install Android SDK packages (API 35)
         shell: bash
         run: |
           set -euxo pipefail
@@ -58,74 +46,15 @@ jobs:
           sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
             "platform-tools" \
             "cmdline-tools;latest" \
-            "platforms;android-${TARGET_SDK}" \
-            "build-tools;${BUILD_TOOLS}"
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "cmake;3.10.2.4988404" \
+            "ndk;28.1.13356709"
 
           echo "Build-tools:"
           ls -la "$ANDROID_SDK_ROOT/build-tools" || true
           echo "Platforms:"
           ls -la "$ANDROID_SDK_ROOT/platforms" || true
-
-      - name: Patch export_presets.cfg to set target/min SDK
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          test -f export_presets.cfg
-
-          # Ensure these keys exist under [preset.0.options]
-          # Godot forums point to setting gradle_build/target_sdk to resolve build-tools mismatch. :contentReference[oaicite:3]{index=3}
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
-
-          p = Path("export_presets.cfg")
-          text = p.read_text(encoding="utf-8")
-
-          # Find the [preset.0.options] section
-          m = re.search(r"\[preset\.0\.options\]\n", text)
-          if not m:
-            raise SystemExit("export_presets.cfg missing [preset.0.options] section")
-
-          start = m.end()
-          # Section ends at next [preset.X] or end of file
-          end_m = re.search(r"\n\[(preset\.\d+|\w+)\]", text[start:])
-          end = start + end_m.start() if end_m else len(text)
-
-          section = text[start:end]
-
-          def upsert(section, key, value):
-            pat = re.compile(rf"^{re.escape(key)}=.*$", re.MULTILINE)
-            line = f'{key}={value}'
-            if pat.search(section):
-              section = pat.sub(line, section)
-            else:
-              # add near top of options section
-              section = line + "\n" + section
-            return section
-
-          TARGET_SDK = "33"
-          MIN_SDK = "24"
-
-          section = upsert(section, "gradle_build/target_sdk", TARGET_SDK)
-          section = upsert(section, "gradle_build/min_sdk", MIN_SDK)
-
-          # Reconstruct
-          new_text = text[:start] + section + text[end:]
-          p.write_text(new_text, encoding="utf-8")
-          print("Patched export_presets.cfg with target/min sdk.")
-          PY
-
-          echo "----- export_presets.cfg (preset.0.options) -----"
-          awk 'BEGIN{p=0} /^\[preset\.0\.options\]/{p=1} p{print} /^\[preset\.[1-9]/{exit}' export_presets.cfg || true
-          echo "-------------------------------------------------"
-
-      - name: Verify Android export templates exist
-        shell: bash
-        run: |
-          set -euxo pipefail
-          find "$HOME/.local/share/godot/export_templates" -maxdepth 4 -type f \
-            -name "android_debug.apk" -o -name "android_release.apk" | head -n 50
 
       - name: Create debug keystore
         shell: bash
@@ -140,28 +69,54 @@ jobs:
             -dname "CN=Android Debug,O=Android,C=US"
           test -f "$GITHUB_WORKSPACE/debug.keystore"
 
+      - name: Clean invalid preset overrides (min_sdk/target_sdk require Gradle build)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f export_presets.cfg
+
+          # Remove lines that break non-Gradle exports:
+          # "Min SDK" and "Target SDK" overrides only allowed when use_gradle_build=true
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("export_presets.cfg")
+          s = p.read_text(encoding="utf-8").splitlines(True)
+
+          bad_prefixes = ("gradle_build/min_sdk=", "gradle_build/target_sdk=")
+          out = [line for line in s if not line.strip().startswith(bad_prefixes)]
+
+          p.write_text("".join(out), encoding="utf-8")
+          print("Stripped gradle_build/min_sdk and gradle_build/target_sdk from export_presets.cfg")
+          PY
+
+          echo "----- export_presets.cfg (Android options snippet) -----"
+          awk 'BEGIN{p=0} /^\[preset\.0\.options\]/{p=1} p{print} /^\[preset\.[1-9]/{exit}' export_presets.cfg || true
+          echo "--------------------------------------------------------"
+
       - name: Configure Godot Editor Settings for Android export
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$HOME/.config/godot"
-          SETTINGS="$HOME/.config/godot/editor_settings-4.tres"
 
-          printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
+          # Godot 4.4.x reads editor_settings-4.4.tres; also write editor_settings-4.tres for safety.
+          for SETTINGS in "$HOME/.config/godot/editor_settings-4.tres" "$HOME/.config/godot/editor_settings-4.4.tres"; do
+            printf '[gd_resource type="EditorSettings" format=3]\n[resource]\n' > "$SETTINGS"
 
-          echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
-          echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
-          echo "export/android/adb = \"$ANDROID_SDK_ROOT/platform-tools/adb\"" >> "$SETTINGS"
-          echo "export/android/jarsigner = \"$JAVA_HOME/bin/jarsigner\"" >> "$SETTINGS"
+            echo "export/android/java_sdk_path = \"$JAVA_HOME\"" >> "$SETTINGS"
+            echo "export/android/android_sdk_path = \"$ANDROID_SDK_ROOT\"" >> "$SETTINGS"
+            echo "export/android/adb = \"$ANDROID_SDK_ROOT/platform-tools/adb\"" >> "$SETTINGS"
+            echo "export/android/jarsigner = \"$JAVA_HOME/bin/jarsigner\"" >> "$SETTINGS"
 
-          # Debug keystore trio (all-or-nothing)
-          echo "export/android/debug_keystore = \"$GITHUB_WORKSPACE/debug.keystore\"" >> "$SETTINGS"
-          echo "export/android/debug_keystore_user = \"androiddebugkey\"" >> "$SETTINGS"
-          echo "export/android/debug_keystore_pass = \"android\"" >> "$SETTINGS"
+            # Debug keystore must be all-or-nothing
+            echo "export/android/debug_keystore = \"$GITHUB_WORKSPACE/debug.keystore\"" >> "$SETTINGS"
+            echo "export/android/debug_keystore_user = \"androiddebugkey\"" >> "$SETTINGS"
+            echo "export/android/debug_keystore_pass = \"android\"" >> "$SETTINGS"
+          done
 
-          echo "----- editor_settings-4.tres -----"
-          cat "$SETTINGS"
-          echo "---------------------------------"
+          echo "----- editor_settings-4.4.tres -----"
+          cat "$HOME/.config/godot/editor_settings-4.4.tres" || true
+          echo "-----------------------------------"
 
           test -x "$ANDROID_SDK_ROOT/platform-tools/adb"
           test -x "$JAVA_HOME/bin/jarsigner"
@@ -179,8 +134,8 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
 
-          echo "----- LAST 250 LINES export.log -----"
-          tail -n 250 export.log || true
+          echo "----- LAST 120 LINES export.log -----"
+          tail -n 120 export.log || true
           echo "-------------------------------------"
 
           test -f "$OUT_APK"
