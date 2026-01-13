@@ -203,6 +203,10 @@ jobs:
           test -f "$JAVA_HOME/bin/jarsigner"
           test -f "$ANDROID_SDK_ROOT/platform-tools/adb" || true
 
+      - name: Verify Android export templates exist
+        run: |
+          ls -l "$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES_DIRNAME}" || true
+          
       - name: Export APK (debug)
         shell: bash
         run: |
